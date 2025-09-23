@@ -19,6 +19,9 @@ import numpy as np
 import zmq
 import zmq.asyncio
 
+
+from fastapi.responses import JSONResponse
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.storage_backend.connector.nixl_connector_v3 import (
@@ -276,7 +279,7 @@ async def handle_completions(request: Request):
         req_data["max_tokens"] = org_max_tokens - 1
         req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
         req_data.pop("kv_transfer_params")
-        req_data["stream"] = True
+        req_data["stream"] = False
         if stream_options is not None:
             req_data["stream_options"] = stream_options
 
@@ -310,7 +313,15 @@ async def handle_completions(request: Request):
             ):
                 yield chunk
 
-        return StreamingResponse(generate_stream(), media_type="application/json")
+        # return StreamingResponse(generate_stream(), media_type="application/json")
+        await wait_decode_kv_ready(req_id, num_tp_rank)
+        logger.debug(f"decode send for req {req_id}")
+        decode_output = await send_request_to_service(
+            decode_client.client, "/v1/completions", req_data
+        )
+        decode_output = decode_output.json()
+        logger.info(f"decode_output is {decode_output}")
+        return JSONResponse(content=decode_output)
 
     except Exception as e:
         # Standard

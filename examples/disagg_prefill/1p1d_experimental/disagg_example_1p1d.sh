@@ -100,13 +100,13 @@ wait_for_server() {
 
 
 main() {
-    check_hf_token
-    check_num_gpus
-    ensure_python_library_installed lmcache
-    ensure_python_library_installed nixl
-    ensure_python_library_installed pandas
-    ensure_python_library_installed datasets
-    ensure_python_library_installed vllm
+    # check_hf_token
+    # check_num_gpus
+    # ensure_python_library_installed lmcache
+    # ensure_python_library_installed nixl
+    # ensure_python_library_installed pandas
+    # ensure_python_library_installed datasets
+    # ensure_python_library_installed vllm
 
     trap cleanup INT
     trap cleanup USR1
@@ -124,8 +124,8 @@ main() {
         --num-prefillers 1 \
         --decoder-host localhost \
         --decoder-port 7200  \
-        --decoder-init-port 7300 \
-        --decoder-alloc-port 7400 \
+        --decoder-init-port 7300,7301 \
+        --decoder-alloc-port 7400,7401 \
         --proxy-host localhost \
         --proxy-port 7500 \
         --num-decoders 1 \

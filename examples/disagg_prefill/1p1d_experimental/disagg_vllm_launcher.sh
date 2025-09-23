@@ -12,7 +12,7 @@ fi
 
 if [[ $# -eq 1 ]]; then
     echo "Using default model: meta-llama/Llama-3.1-8B-Instruct"
-    MODEL="meta-llama/Llama-3.1-8B-Instruct"
+    MODEL="Qwen/Qwen2.5-7B"
 else
     echo "Using model: $2"
     MODEL=$2
@@ -27,10 +27,16 @@ if [[ $1 == "prefiller" ]]; then
         LMCACHE_CONFIG_FILE=$prefill_config_file \
         VLLM_ENABLE_V1_MULTIPROCESSING=1 \
         VLLM_WORKER_MULTIPROC_METHOD=spawn \
-        CUDA_VISIBLE_DEVICES=0 \
+        CUDA_VISIBLE_DEVICES=0,1 \
+        NIXL_DELETE_PORT=10003,10004 \
         vllm serve $MODEL \
         --port 7100 \
+        --gpu-memory-utilization 0.37 \
+        --max-model-len 1000 \
+        -tp 2 \
+        --max-num-batched-tokens 1000 \
         --disable-log-requests \
+        --max-num-seqs 1 \
         --enforce-eager \
         --no-enable-prefix-caching \
         --kv-transfer-config \
@@ -47,10 +53,16 @@ elif [[ $1 == "decoder" ]]; then
         LMCACHE_CONFIG_FILE=$decode_config_file \
         VLLM_ENABLE_V1_MULTIPROCESSING=1 \
         VLLM_WORKER_MULTIPROC_METHOD=spawn \
-        CUDA_VISIBLE_DEVICES=1 \
+        CUDA_VISIBLE_DEVICES=0,1 \
+        NIXL_DELETE_PORT=10001,10002 \
         vllm serve $MODEL \
         --port 7200 \
+        --gpu-memory-utilization 0.39 \
+        --max-model-len 1000 \
+        -tp 2 \
+        --max-num-batched-tokens 1000 \
         --disable-log-requests \
+        --max-num-seqs 10 \
         --enforce-eager \
         --no-enable-prefix-caching \
         --kv-transfer-config \
