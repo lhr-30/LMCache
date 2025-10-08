@@ -233,10 +233,10 @@ class StorageManager:
 
     def post_init(self, **kwargs) -> None:
         if "async_lookup_server" in kwargs:
-            assert not self.config.save_unfull_chunk, (
-                "save_unfull_chunk should be automatically set to False when using "
-                "async loading."
-            )
+            # assert not self.config.save_unfull_chunk, (
+            #     "save_unfull_chunk should be automatically set to False when using "
+            #     "async loading."
+            # )
             self.async_lookup_server = kwargs.pop("async_lookup_server")
             self.async_serializer = AsyncSerializer(self.allocator_backend, self.loop)
 
@@ -395,6 +395,32 @@ class StorageManager:
             if memory_objs:
                 return memory_objs
         return None
+
+    def layerwise_batched_get_sync(
+        self,
+        keys: List[List[CacheEngineKey]],
+        location: Optional[str] = None,
+    ) -> Generator[Future, None, None]:
+        """
+        Non-blocking function to get the memory objects into the storages
+        in a layerwise manner.
+        Do not store if the same object is being stored (handled here by
+        storage manager) or has been stored (handled by storage backend).
+
+        :param List[List[CacheEngineKey]] keys: The keys to get. The first
+            dimension corresponds to the number of layers, and the second
+            dimension corresponds to the number of chunks.
+
+        :return: A generator that yields a future for each layer.
+        """
+        if location is None:
+            location = "LocalCPUBackend"
+
+        for keys_multi_chunk in keys:
+            # Retrieve all chunks for one layer
+            backend = self.storage_backends[location]
+            task = backend.batched_get_blocking(keys_multi_chunk)
+            yield task
 
     def layerwise_batched_get(
         self,

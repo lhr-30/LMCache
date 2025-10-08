@@ -133,6 +133,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 return None
 
             memory_obj.ref_count_up()
+            # logger.info(f"Local CPU backend storing key {key}")
             self.hot_cache[key] = memory_obj
 
             self.cache_policy.update_on_put(key)
@@ -176,6 +177,19 @@ class LocalCPUBackend(AllocatorBackendInterface):
             # ref count up themselves
             memory_obj.ref_count_up()
             return memory_obj
+
+    def batched_get_blocking(
+        self,
+        keys: list[CacheEngineKey],
+        transfer_spec: Any = None,
+    ) -> list[MemoryObj]:
+        mem_objs = []
+        with self.cpu_lock:
+            for key in keys:
+                mem_obj = self.hot_cache[key]
+                mem_obj.ref_count_up()
+                mem_objs.append(mem_obj)
+        return mem_objs
 
     async def batched_get_non_blocking(
         self,
