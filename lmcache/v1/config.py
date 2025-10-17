@@ -136,6 +136,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "blending_mode": {
+        "type": str,
+        "default": "cacheblend",
+        "env_converter": str,
+    },
     "blend_recompute_ratios": {
         "type": Optional[list[float]],
         "default": None,
@@ -505,6 +510,7 @@ def _to_original_config(self):
         pipelined_backend=False,
         save_decode_cache=self.save_decode_cache,
         enable_blending=self.enable_blending,
+        blending_mode=self.blending_mode,
         blend_recompute_ratio=0.15,
         blend_min_tokens=self.blend_min_tokens,
         blend_separator="[BLEND_SEP]",

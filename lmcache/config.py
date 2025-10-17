@@ -67,6 +67,7 @@ class LMCacheEngineConfig:
     save_decode_cache: bool  # whether to store decode kv cache
 
     enable_blending: bool  # whether to enable blending
+    blending_mode: str  # blending mode, can be "cacheblend" or "pie"
     blend_recompute_ratio: float  # the ratio of blending recompute
     blend_min_tokens: int  # the minimum number of tokens for blending
     blend_separator: str  # the separator for blending
@@ -83,6 +84,7 @@ class LMCacheEngineConfig:
         pipelined_backend: bool = False,
         save_decode_cache: bool = False,
         enable_blending: bool = False,
+        blending_mode: str = "cacheblend",
         blend_recompute_ratio: float = 0.15,
         blend_min_tokens: int = 256,
         blend_separator: str = blend_default_separator,
@@ -97,6 +99,7 @@ class LMCacheEngineConfig:
             pipelined_backend,
             save_decode_cache,
             enable_blending,
+            blending_mode,
             blend_recompute_ratio,
             blend_min_tokens,
             blend_separator,
@@ -135,6 +138,7 @@ class LMCacheEngineConfig:
             pipelined_backend,
             save_decode_cache,
             enable_blending=False,
+            blending_mode="cacheblend",
             blend_recompute_ratio=0.15,
             blend_min_tokens=256,
             blend_separator=blend_default_separator,
@@ -157,6 +161,7 @@ class LMCacheEngineConfig:
         pipelined_backend = config.get("pipelined_backend", False)
         save_decode_cache = config.get("save_decode_cache", False)
         enable_blending = config.get("enable_blending", False)
+        blending_mode = config.get("blending_mode", "cacheblend")
         blend_recompute_ratio = config.get("blend_recompute_ratio", 0.15)
         blend_min_tokens = config.get("blend_min_tokens", 256)
         blend_separator = config.get("blend_separator", blend_default_separator)
@@ -187,6 +192,7 @@ class LMCacheEngineConfig:
             pipelined_backend,
             save_decode_cache,
             enable_blending,
+            blending_mode,
             blend_recompute_ratio,
             blend_min_tokens,
             blend_separator,
@@ -243,6 +249,9 @@ class LMCacheEngineConfig:
         )
         config.enable_blending = parse_env(
             get_env_name("enable_blending"), config.enable_blending
+        )
+        config.blending_mode = parse_env(
+            get_env_name("blending_mode"), config.blending_mode
         )
         config.blend_recompute_ratio = float(
             parse_env(

@@ -5,6 +5,7 @@ import abc
 
 # Third Party
 import torch
+import nvtx
 
 # First Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -353,6 +354,15 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
+        
+        self.rope_stream = torch.cuda.Stream()
+        self.to_page_mem_stream = torch.cuda.Stream()
+        
+        self.load_done_event_list = []
+        self.rope_done_event_lsit = []
+        for _ in range(self.num_layers):
+            self.load_done_event_list.append(torch.cuda.Event())
+            self.rope_done_event_lsit.append(torch.cuda.Event())
 
         self.buffer_mapping: dict[int, MemoryObj] = {}
 
@@ -362,6 +372,9 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.use_gpu = use_gpu
         self.gpu_buffer_allocator = None
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
+        
+    def get_page_stream(self):
+        return self.to_page_mem_stream
 
     def _lazy_initialize_buffer(self, kv_caches):
         """
@@ -452,6 +465,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             # TODO(Jiayi): Make this more elegant
             self.lmc_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
             self.fused_rotary_emb = self.lmc_model.fused_rotary_emb
+            self.lmc_model.rope_cache_to_device(self.device)
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
@@ -479,98 +493,138 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         buffer_shape = self.get_shape(num_all_tokens)
         assert self.gpu_buffer_allocator is not None
-        compute_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-            buffer_shape, self.dtype, MemoryFormat.KV_2TD
-        )
-        load_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-            buffer_shape, self.dtype, MemoryFormat.KV_2TD
-        )
-        assert compute_gpu_buffer_obj is not None, (
-            "Failed to allocate GPU buffer in GPUConnector"
-        )
-        assert load_gpu_buffer_obj is not None, (
-            "Failed to allocate GPU buffer in GPUConnector"
-        )
-        assert compute_gpu_buffer_obj.tensor is not None
-        assert load_gpu_buffer_obj.tensor is not None
+        # compute_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+        #     buffer_shape, self.dtype, MemoryFormat.KV_2TD
+        # )
+        # load_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+        #     buffer_shape, self.dtype, MemoryFormat.KV_2TD
+        # )
+        # assert compute_gpu_buffer_obj is not None, (
+        #     "Failed to allocate GPU buffer in GPUConnector"
+        # )
+        # assert load_gpu_buffer_obj is not None, (
+        #     "Failed to allocate GPU buffer in GPUConnector"
+        # )
+        # assert compute_gpu_buffer_obj.tensor is not None
+        # assert load_gpu_buffer_obj.tensor is not None
+        gpu_buffer_obj_list = []
+        for idx in range(self.num_layers):
+            gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                buffer_shape, self.dtype, MemoryFormat.KV_2TD
+            )
+            assert gpu_buffer_obj is not None, (
+                "Failed to allocate GPU buffer in GPUConnector"
+            )
+            assert gpu_buffer_obj.tensor is not None
+            gpu_buffer_obj_list.append(gpu_buffer_obj)
+        
 
         # current_stream = torch.cuda.current_stream()
+        model_executor = kwargs["model_executor"]
 
         if self.cache_positions:
             old_positions_full = torch.zeros(
                 (num_all_tokens,), dtype=torch.int64, device=self.kvcaches[0].device
             )
         for layer_id in range(self.num_layers + 2):
-            if layer_id > 1:
-                lmc_ops.single_layer_kv_transfer(
-                    self.buffer_mapping[layer_id - 2].tensor,
-                    self.kvcaches[layer_id - 2],
-                    slot_mapping_full,
-                    False,
-                    False,  # shape is [2, num_tokens, hidden_dim]
-                    self.vllm_two_major,
-                )
-                del self.buffer_mapping[layer_id - 2]
-
-                logger.debug(f"Finished loading layer {layer_id - 2} into paged memory")
-
-            if layer_id > 0 and layer_id <= self.num_layers:
-                # NOTE: wait until both compute and load streams are done
-                torch.cuda.synchronize()
-
-                # ping-pong the buffers
-                compute_gpu_buffer_obj, load_gpu_buffer_obj = (
-                    load_gpu_buffer_obj,
-                    compute_gpu_buffer_obj,
-                )
-
-                if self.cache_positions:
-                    assert compute_gpu_buffer_obj.tensor is not None
-
-                    compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
-                        old_positions_full,
-                        new_positions_full,
-                        compute_gpu_buffer_obj.tensor[0],
-                    )
-
-                # gap zeroing after RoPE
-                if self.current_gap_positions.numel():
-                    compute_gpu_buffer_obj.tensor[:, self.current_gap_positions] = 0.0
-
-                self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
-
-                logger.debug(f"Finished loading layer {layer_id - 1} into buffer")
-
+            logger.debug(f"Start processing layer {layer_id}")
+            
+            # ==================== Stage 1: Load (layer i) ====================
             if layer_id < self.num_layers:
                 memory_objs_layer = yield
-
-                # memobj -> gpu_buffer
-                with torch.cuda.stream(self.load_stream):
+                if self.cache_positions and layer_id == 0:
                     for start, end, memory_obj in zip(
-                        starts, ends, memory_objs_layer, strict=False
-                    ):
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
-                        assert load_gpu_buffer_obj.tensor is not None
-                        load_gpu_buffer_obj.tensor[0][
-                            start - buf_offset : end - buf_offset
-                        ].copy_(memory_obj.tensor[0], non_blocking=True)
-
-                        load_gpu_buffer_obj.tensor[1][
-                            start - buf_offset : end - buf_offset
-                        ].copy_(memory_obj.tensor[1], non_blocking=True)
-
-                        if self.cache_positions and layer_id == 0:
+                            starts, ends, memory_objs_layer, strict=False
+                        ):
                             old_positions_full[
                                 start - buf_offset : end - buf_offset
                             ] = memory_obj.metadata.old_positions
+                            
+                with nvtx.annotate(f"[Stage 1] MemObj -> GPU Buffer | layer {layer_id}", color="orange"):
+                    # memobj -> gpu_buffer
+                    with torch.cuda.stream(self.load_stream):
+                        load_gpu_buffer_obj = gpu_buffer_obj_list[layer_id]
+                        for start, end, memory_obj in zip(
+                            starts, ends, memory_objs_layer, strict=False
+                        ):
+                            assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
+                            assert load_gpu_buffer_obj.tensor is not None
+                            load_gpu_buffer_obj.tensor[0][
+                                start - buf_offset : end - buf_offset
+                            ].copy_(memory_obj.tensor[0], non_blocking=True)
 
-            elif layer_id == self.num_layers:
+                            load_gpu_buffer_obj.tensor[1][
+                                start - buf_offset : end - buf_offset
+                            ].copy_(memory_obj.tensor[1], non_blocking=True)
+                        self.load_done_event_list[layer_id].record(self.load_stream)
+                        
+                logger.debug(f"Start to load layer {layer_id} into GPU buffer")
+                
+            # ==================== Stage 2: RoPE (layer i-1) ====================
+            if layer_id > 0 and layer_id <= self.num_layers:
+                # NOTE: wait until both compute and load streams are done
+                if self.cache_positions:
+                    with nvtx.annotate(f"[Stage 2] Wait for loading | layer {layer_id - 1}", color="blue"):
+                        self.rope_stream.wait_event(self.load_done_event_list[layer_id - 1])
+                    #     self.rope_stream.synchronize()
+                        
+                    compute_gpu_buffer_obj = gpu_buffer_obj_list[layer_id - 1]
+                    logger.info(f"shape of compute_gpu_buffer_obj: {compute_gpu_buffer_obj.tensor[0].shape}")
+                    assert compute_gpu_buffer_obj.tensor is not None
+                    
+                    with nvtx.annotate(f"[Stage 2] RoPE | layer {layer_id - 1}", color="yellow"):
+                        with torch.cuda.stream(self.rope_stream):
+                            compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
+                                old_positions_full,
+                                new_positions_full,
+                                compute_gpu_buffer_obj.tensor[0],
+                            )
+                            self.rope_done_event_lsit[layer_id - 1].record(self.rope_stream)
+                        # gap zeroing after RoPE
+                        # if self.current_gap_positions.numel():
+                        #     compute_gpu_buffer_obj.tensor[:, self.current_gap_positions] = 0.0
+                        self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
+                    logger.debug(f"Start to do RoPE for layer {layer_id - 1}")
+            
+            # ==================== Stage 3: Blending + Transfer (layer i-2) ====================
+            if layer_id > 1:
+                self.to_page_mem_stream.wait_event(self.rope_done_event_lsit[layer_id - 2])
+                
+                with nvtx.annotate(f"[Stage 3] Blending | layer {layer_id - 2}", color="yellow"):
+                    # NOTE: run blending in the page stream
+                    if self.current_gap_positions.numel():
+                            self.buffer_mapping[layer_id - 2].tensor[:, self.current_gap_positions] = 0.0
+                    next(model_executor)
+
+                with nvtx.annotate(f"[Stage 3] KV Transfer | layer {layer_id - 2}", color="green"):
+                    with torch.cuda.stream(self.to_page_mem_stream):
+                        lmc_ops.single_layer_kv_transfer(
+                            self.buffer_mapping[layer_id - 2].tensor,
+                            self.kvcaches[layer_id - 2],
+                            slot_mapping_full,
+                            False,
+                            False,  # shape is [2, num_tokens, hidden_dim]
+                            self.vllm_two_major,
+                        )
+
+                logger.debug(f"Start to load layer {layer_id - 2} into paged memory")
+               
+            if layer_id == self.num_layers:
                 yield
 
         # free the buffer memory
-        load_gpu_buffer_obj.ref_count_down()
-        compute_gpu_buffer_obj.ref_count_down()
+        for idx in range(self.num_layers):
+            gpu_buffer_obj_list[idx].ref_count_down()
 
+        with nvtx.annotate("Final Sync", color="purple"):
+            self.load_stream.synchronize()
+            self.rope_stream.synchronize()
+            self.to_page_mem_stream.synchronize()
+        
+        for k in list(self.buffer_mapping.keys()):
+            del self.buffer_mapping[k]
+        self.buffer_mapping.clear()
+        
         assert len(self.buffer_mapping) == 0, (
             "There are still layers in the buffer mapping after "
             "releasing the GPU buffers."

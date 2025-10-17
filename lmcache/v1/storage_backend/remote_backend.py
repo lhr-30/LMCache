@@ -126,7 +126,11 @@ class RemoteBackend(StorageBackendInterface):
         except Exception as e:
             with self.lock:
                 self.failure_time = time.time()
-            logger.warning(f"Failed to initialize/re-establish remote connection: {e}")
+            import traceback
+            logger.warning(
+                f"Failed to initialize/re-establish remote connection: {e}\n"
+                f"{traceback.format_exc()}"
+            )
             self.connection = None
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:

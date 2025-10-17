@@ -310,9 +310,15 @@ class SegmentTokenDatabase(TokenDatabase):
         # TODO (Jiayi): figure out how to decide when
         # to use `1:` (whether there's a special starting token
         # in the beginning)
-        self.sep_tokens = self.tokenizer.encode(config.blend_special_str)[1:]
+        self.sep_tokens = self.tokenizer.encode(config.blend_special_str, add_special_tokens=False)
         self.sep_tokens = torch.tensor(self.sep_tokens, device="cpu")
         self.sep_len = len(self.sep_tokens)
+
+        logger.info(
+            f"Using blend special str: {config.blend_special_str} "
+            f"to separate segments."
+            f" Special token IDs: {self.sep_tokens.tolist()}"
+        )
 
     def _fast_split_by_subtensor(self, tokens: torch.Tensor) -> Iterable[torch.Tensor]:
         """Match the `sep_tokens` with sliding windows"""
@@ -328,6 +334,7 @@ class SegmentTokenDatabase(TokenDatabase):
         matches = (
             (windows == self.sep_tokens).all(dim=1).nonzero(as_tuple=True)[0].tolist()
         )
+        # logger.info(f"Found {len(matches)} segments in the input tokens. matches: {matches}")
 
         # Split based on matches
         start = 0
@@ -423,5 +430,59 @@ class SegmentTokenDatabase(TokenDatabase):
                 else:
                     yield start_idx, end_idx, hash_val
                 start_idx = end_idx
+        else:
+            raise ValueError("Either tokens or hashes must be provided.")
+
+
+class PIETokenDatabase(TokenDatabase):
+    """
+    Currently, we still use special separators to identify chunks.
+    In the future, we might need to implement a fast substring match.
+    """
+
+    def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheEngineMetadata):
+        super(SegmentTokenDatabase, self).__init__(config, metadata)
+
+        self.tokenizer = AutoTokenizer.from_pretrained(metadata.model_name)
+
+        # TODO (Jiayi): figure out how to decide when
+        # to use `1:` (whether there's a special starting token
+        # in the beginning)
+
+    def process_tokens(
+        self,
+        tokens: Optional[Union[torch.Tensor, List[int]]] = None,
+        hashes: Optional[List[int]] = None,
+        offsets: Optional[List[int]] = None,
+        mask: Optional[torch.Tensor] = None,
+        make_key: bool = True,
+        request_configs: Optional[dict] = None,
+    ) -> Iterable[Tuple[int, int, Union[CacheEngineKey, int]]]:
+        if tokens is not None:
+            if not isinstance(tokens, torch.Tensor):
+                tokens = torch.tensor(tokens, dtype=torch.long, device="cpu")
+            else:
+                tokens = tokens.to(device="cpu", dtype=torch.long)
+
+            if mask is not None:
+                num_falses = mask.numel() - mask.long().sum().item()
+            else:
+                num_falses = 0
+            assert num_falses < len(tokens), (
+                "The number of Falses in the mask shouldn't "
+                "be less than the length of tokens."
+            )
+
+            if make_key:
+                yield (
+                    0,
+                    len(tokens),
+                    self._make_key_by_hash(
+                        self._hash_tokens(tokens), request_configs
+                    ),
+                )
+            else:
+                yield 0, len(tokens), self._hash_tokens(tokens)
+                
         else:
             raise ValueError("Either tokens or hashes must be provided.")
