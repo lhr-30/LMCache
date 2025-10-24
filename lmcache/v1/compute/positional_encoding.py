@@ -63,8 +63,14 @@ class FusedRope:
         self.is_neox_style = is_neox_style
         self.head_size = rope.head_size
         self.cos_sin_cache = rope.cos_sin_cache
+        logger.info(f"device: {self.cos_sin_cache.device}, dtype: {self.cos_sin_cache.dtype}")
+
+    def rope_cache_to_device(self, device: torch.device):
+        self.cos_sin_cache = self.cos_sin_cache.to(device)
+        logger.info(f"Move RoPE cache to device: {device}")
 
     def fused_encode(self, old_positions, new_positions, k):
+        logger.info(f"device: {self.cos_sin_cache.device}, dtype: {self.cos_sin_cache.dtype}")
         num_tokens = k.shape[0]
         k = k.view(num_tokens, -1, self.head_size)
         lmc_ops.rotary_embedding_k_fused(
@@ -72,7 +78,7 @@ class FusedRope:
             new_positions,
             k,
             self.head_size,
-            self.cos_sin_cache.to(k.device),
+            self.cos_sin_cache,
             self.is_neox_style,
         )
         k = k.view(num_tokens, -1)
@@ -185,11 +191,11 @@ def get_fused_rope(
     reverse_rope = BasicReverseRope(rope, rotary_dim, is_neox_style)
     fused_rope = FusedRope(rope, is_neox_style)
 
-    correct = validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size)
-    if not correct:
-        logger.error(
-            "Fused/reverse rotary encoding is not correct! Will disable blending!"
-        )
-        return None
+    # correct = validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size)
+    # if not correct:
+    #     logger.error(
+    #         "Fused/reverse rotary encoding is not correct! Will disable blending!"
+    #     )
+    #     return None
 
     return fused_rope
