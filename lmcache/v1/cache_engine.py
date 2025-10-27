@@ -48,6 +48,7 @@ from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
     ChunkedTokenDatabase,
     SegmentTokenDatabase,
+    PIETokenDatabase,
     TokenDatabase,
 )
 
@@ -200,6 +201,7 @@ class LMCacheEngine:
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
+        logger.info("Storing KV cache")
         if self._is_passive():
             logger.debug(f"rank={self.metadata.worker_id} ignore store")
             return
@@ -248,6 +250,9 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
             # Allocate the memory object
             num_tokens = end - start
+            logger.info(
+                f"Storing tokens from {start} to {end}, number tokens is {num_tokens}"
+            )
             kv_shape = self.gpu_connector.get_shape(num_tokens)
             kv_dtype = self.metadata.kv_dtype
 
@@ -274,6 +279,7 @@ class LMCacheEngine:
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
             return
+        logger.info(f"gpu connector type: {type(self.gpu_connector)}")
         self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
         offload_time += time.perf_counter() - t
 
@@ -327,7 +333,7 @@ class LMCacheEngine:
             storage backends. In the last iteration, it puts the memory objects
             of the last layer to the storage backends.
         """
-
+        logger.info("Storing layerwise KV cache")
         if mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
         else:
@@ -588,7 +594,7 @@ class LMCacheEngine:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            get_generator = self.storage_manager.layerwise_batched_get(keys_layer_major)
+            get_generator = self.storage_manager.layerwise_batched_get_sync(keys_layer_major)
 
             assert isinstance(
                 self.gpu_connector,
@@ -614,7 +620,7 @@ class LMCacheEngine:
                 else:
                     yield None
 
-                mem_objs_layer = task.result()
+                mem_objs_layer = task
                 mem_obj_consumer.send(mem_objs_layer)
                 to_count_down.extend(mem_objs_layer)
 
@@ -707,6 +713,7 @@ class LMCacheEngine:
 
                     found = False
                     for key_single_layer in key_all_layers:
+                        # logger.info(f"Looking up key: {key_single_layer}")
                         if self.storage_manager.contains(
                             key_single_layer, search_range, pin
                         ):
@@ -1121,6 +1128,7 @@ class LMCacheEngine:
             else:
                 # NOTE: key should always be in the lookup cache once
                 # we support it.
+                logger.info(f"lookup for key: {key}, start: {start}, end: {end}")
                 location = self.storage_manager.contains(key)
                 if location is None:
                     break
@@ -1128,6 +1136,7 @@ class LMCacheEngine:
                 # NOTE: Here we make the assumption that the underlying
                 # storage backend support pin operation, and the memory
                 # object is already pinned in the storage backend.
+                logger.info(f"Cache hit for key: {key} at location: {location}, start: {start}, end: {end}")  # noqa: E501
                 ret_mask[start:end] = True
 
             assert location is not None
@@ -1347,7 +1356,12 @@ class LMCacheEngineBuilder:
         metadata: LMCacheEngineMetadata,
     ) -> TokenDatabase:
         if config.enable_blending:
-            return SegmentTokenDatabase(config, metadata)
+            if config.blending_mode == "cacheblend":
+                logger.info("Using SegmentTokenDatabase as token database.")
+                return SegmentTokenDatabase(config, metadata)
+            elif config.blending_mode == "pie":
+                logger.info("Using PIETokenDatabase as token database.")
+                return PIETokenDatabase(config, metadata)
         return ChunkedTokenDatabase(config, metadata)
 
     @classmethod

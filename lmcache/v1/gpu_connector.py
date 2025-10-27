@@ -304,6 +304,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             # Force a synchronize if the target buffer is NOT CUDA device
             # NOTE: for better performance, we may not want to sync for every
             # memory object
+            logger.info("Synchronizing store stream since target is not CUDA.")
             self.store_stream.synchronize()
 
         if self.use_mla:

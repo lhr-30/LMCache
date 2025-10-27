@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.output import NewRequestData
     from vllm.v1.request import Request
+    
+import time
 
 logger = init_logger(__name__)
 
@@ -284,6 +286,7 @@ class ReqMeta:
         """
         input_token_ids = tracker.token_ids
         input_token_len = len(input_token_ids)
+        # logger.info(f"Request {tracker.req_id} input_token_len: {input_token_len}, tracker.prompt_len: {tracker.prompt_len}")
 
         is_last_prefill = False
         if input_token_len == tracker.prompt_len:
@@ -324,6 +327,7 @@ class ReqMeta:
             if not is_last_prefill or discard_partial_chunks
             else input_token_len
         )
+        # logger.info(f"Request {tracker.req_id} num_tokens_to_save: {num_tokens_to_save}, skip_save: {skip_save}, is_last_prefill: {is_last_prefill}")
 
         # If we need to save, update the number of saved tokens
         if not skip_save:
@@ -503,14 +507,28 @@ def _init_lmcache_engine(
     if lmcache_config.use_layerwise:
         if lmcache_config.enable_blending:
             # Use layerwise connector for blending
-            vllm_gpu_connector = VLLMBufferLayerwiseGPUConnector(
-                hidden_dim_size,
-                num_layer,
-                use_gpu=use_gpu,
-                chunk_size=chunk_size,
-                dtype=kv_dtype,
-                device=device,
-            )
+            if lmcache_config.blending_mode == "cacheblend":
+                vllm_gpu_connector = VLLMBufferLayerwiseGPUConnector(
+                    hidden_dim_size,
+                    num_layer,
+                    use_gpu=use_gpu,
+                    chunk_size=chunk_size,
+                    dtype=kv_dtype,
+                    device=device,
+                )
+            elif lmcache_config.blending_mode == "pie":
+                vllm_gpu_connector = VLLMBufferLayerwiseGPUConnector(
+                    hidden_dim_size,
+                    num_layer,
+                    use_gpu=use_gpu,
+                    chunk_size=chunk_size,
+                    dtype=kv_dtype,
+                    device=device,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported blending mode {lmcache_config.blending_mode}"
+                )
         else:
             vllm_gpu_connector = VLLMPagedMemLayerwiseGPUConnector(
                 hidden_dim_size,
@@ -599,6 +617,7 @@ class LMCacheConnectorV1Impl:
             self.lookup_client = LookupClientFactory.create_lookup_client(
                 vllm_config, config
             )
+            logger.info(f"Creating LMCache lookup client, client: {self.lookup_client}")
             self._unfinished_requests: dict[str, Request] = {}
             self.lmcache_engine = None
         else:
@@ -609,6 +628,10 @@ class LMCacheConnectorV1Impl:
 
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
+            logger.info(
+                f"LMCache use_layerwise: {self.use_layerwise}, "
+                f"enable_blending: {self.enable_blending}"
+            )
 
             if self.enable_blending:
                 self.blender = LMCBlenderBuilder.get_or_create(
@@ -632,7 +655,9 @@ class LMCacheConnectorV1Impl:
 
             # In case of MLA, the lookup server is only created on worker 0
             if self.async_loading and self.lookup_server is not None:
+                logger.info("Starting async lookup server")
                 assert isinstance(self.lookup_server, LMCacheAsyncLookupServer)
+                logger.info("Asserted async lookup server")
                 self.lmcache_engine.post_init(async_lookup_server=self.lookup_server)
 
         self.kv_caches: dict[str, torch.Tensor] = {}
@@ -834,6 +859,7 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            logger.info(f"Loading KV for request {request.req_id} with {len(tokens)} tokens, LMCache cached tokens: {lmcache_cached_tokens}, masked_token_count: {masked_token_count}")
             if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
@@ -842,11 +868,20 @@ class LMCacheConnectorV1Impl:
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
+                    start_blending = time.perf_counter()
+                    page_stream = self.lmcache_engine.gpu_connector.get_page_stream()
+                    # page_stream = None
                     self.blender.blend(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        page_stream=page_stream,
+                    )
+                    end_blending = time.perf_counter()
+                    logger.info(
+                        f"Blending time for request {request.req_id}: "
+                        f"{end_blending - start_blending:.4f} seconds"
                     )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
@@ -958,6 +993,7 @@ class LMCacheConnectorV1Impl:
                     continue
 
                 token_ids = request.token_ids
+                logger.info(f"Saving KV cache for request {request.req_id} with {len(token_ids)} tokens")
                 assert isinstance(token_ids, list)
 
                 slot_mapping = request.slot_mapping
@@ -1048,6 +1084,7 @@ class LMCacheConnectorV1Impl:
                 continue
 
             token_ids = request.token_ids
+            logger.info(f"Saving KV cache for request {request.req_id} with {len(token_ids)} tokens")
 
             slot_mapping = request.slot_mapping
             assert isinstance(slot_mapping, torch.Tensor)
@@ -1298,6 +1335,7 @@ class LMCacheConnectorV1Impl:
 
         for request in scheduler_output.scheduled_new_reqs:
             # Right now, we only load KV for new requests
+            logger.info(f"in buildiong connector metadata request {len(request.prompt_token_ids)}")
             load_spec = self.load_specs.pop(request.req_id, None)
             num_tokens_to_compute = (
                 request.num_computed_tokens
