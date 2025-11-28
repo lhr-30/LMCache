@@ -52,6 +52,8 @@ from lmcache.v1.token_database import (
     TokenDatabase,
 )
 
+import nvtx
+
 logger = init_logger(__name__)
 
 
@@ -418,6 +420,103 @@ class LMCacheEngine:
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
         logger.debug(f"Stored {tot_token_num} out of total {len(tokens)} tokens")
         yield
+        
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def store_layer_batch(
+        self,
+        all_tokens: list[Union[torch.Tensor, list[int]]],
+        all_masks: list[Optional[torch.Tensor]] = None,
+        **kwargs,
+    ) -> Generator[None, None, None]:
+        
+        length = 0
+        starts = []
+        ends = []
+        keys = []
+        memory_objs = []
+        num_to_store_tokens = 0
+        for tokens in all_tokens:
+            num_to_store_tokens += len(tokens)
+        monitor_req_id = self.stats_monitor.on_store_request(num_to_store_tokens)
+        logger.info(f"Storing layerwise KV cache in batch, num_to_store_tokens: {num_to_store_tokens} with {len(all_tokens)} reqs")
+        kv_dtype = self.metadata.kv_dtype
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        for tokens, mask in zip(all_tokens, all_masks):
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens, mask=mask, request_configs=request_configs
+            ):
+                assert isinstance(key, CacheEngineKey)
+
+                keys_multi_layer = key.split_layers(self.num_layers)
+                # Only check the first layer
+                if self.storage_manager.contains(keys_multi_layer[0]):
+                    logger.info(f"Key {keys_multi_layer[0]} already exists, skip storing")
+                    continue
+                logger.info(
+                    f"Storing tokens from {start} to {end}, number tokens is {end - start}, key: {keys_multi_layer[0]}"
+                )
+                # Allocate the memory object
+                num_tokens = end - start
+                kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
+
+                memory_objs_multi_layer = self.storage_manager.batched_allocate(
+                    kv_shape_single_layer,
+                    kv_dtype,
+                    batch_size=self.num_layers,
+                    fmt=self.fmt,
+                    busy_loop=self.force_store_wait,
+                )
+
+                if memory_objs_multi_layer is None:
+                    logger.warning(
+                        "Local cpu memory under pressure so"
+                        " choosing to not store the KV cache."
+                    )
+                    break
+
+                starts.append(length)
+                ends.append(length + (end - start))
+                length += (end - start)
+                keys.append(keys_multi_layer)
+                memory_objs.append(memory_objs_multi_layer)
+
+        if keys:
+            # Transpose the keys and memory objects into layer major format
+            memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
+            keys = [list(row) for row in zip(*keys, strict=False)]
+
+            assert isinstance(
+                self.gpu_connector,
+                (
+                    VLLMPagedMemLayerwiseGPUConnector,
+                    VLLMBufferLayerwiseGPUConnector,
+                    SGLangLayerwiseGPUConnector,
+                ),
+            )
+
+            mem_obj_generator = self.gpu_connector.batched_from_gpu_batch(
+                memory_objs, starts, ends, **kwargs
+            )
+            next(mem_obj_generator)
+
+            for layer_id in range(self.num_layers):
+                yield
+                next(mem_obj_generator)
+                # logger.info(f"Storing layer {layer_id} with {len(keys[layer_id])} keys")
+                self.storage_manager.batched_put(keys[layer_id], memory_objs[layer_id])
+        else:
+            # If no cache are found, we still need to yield to avoid
+            # `StopIteration`
+            for layer_id in range(self.num_layers):
+                yield
+
+        self.stats_monitor.on_store_finished(monitor_req_id, num_to_store_tokens)
+        # logger.debug(f"Stored {num_to_store_tokens} out of total {len(tokens)} reqs")
+        yield
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -594,7 +693,10 @@ class LMCacheEngine:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            get_generator = self.storage_manager.layerwise_batched_get_sync(keys_layer_major)
+            # get_generator = self.storage_manager.layerwise_batched_get_sync(keys_layer_major)
+            get_generator = self.storage_manager.layerwise_batched_get(
+                keys_layer_major,
+            )
 
             assert isinstance(
                 self.gpu_connector,
@@ -620,7 +722,7 @@ class LMCacheEngine:
                 else:
                     yield None
 
-                mem_objs_layer = task
+                mem_objs_layer = task.result()
                 mem_obj_consumer.send(mem_objs_layer)
                 to_count_down.extend(mem_objs_layer)
 
@@ -643,6 +745,117 @@ class LMCacheEngine:
             f"Retrieved {retrieved_tokens} "
             f"out of {num_required_tokens} "
             f"out of total {len(tokens)} tokens"
+        )
+
+        yield ret_mask
+    
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def retrieve_layer_batch(
+        self,
+        all_tokens: list[Union[torch.Tensor, list[int]]],
+        all_mask: list[Optional[torch.Tensor]] = None,
+        **kwargs,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        length = 0
+        starts = []
+        ends = []
+        keys = []
+        num_required_tokens = 0
+        for tokens in all_tokens:
+            num_required_tokens += len(tokens)
+            
+        ret_mask = torch.zeros(num_required_tokens, dtype=torch.bool, device="cpu")
+        event = kwargs.get("event", None)
+        
+        assert event is not None, "event is required for batch retrieve_layer"
+            
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+        monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
+        for tokens, mask in zip(all_tokens, all_mask):
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+            ):
+                assert isinstance(key, CacheEngineKey)
+
+                keys_multi_layer = key.split_layers(self.num_layers)
+
+                # NOTE: Only check the first layer
+                if not self.storage_manager.contains(keys_multi_layer[0]):
+                    break
+                
+                ret_mask[start + length : end + length] = True
+                starts.append(length)
+                ends.append(length + (end - start))
+                length += (end - start)
+                keys.append(keys_multi_layer)
+
+        if keys:
+            # Transpose the keys into layer major format
+            keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
+
+            # get_generator = self.storage_manager.layerwise_batched_get_sync(keys_layer_major)
+            get_generator = self.storage_manager.layerwise_batched_get(
+                keys_layer_major,
+            )
+
+            assert isinstance(
+                self.gpu_connector,
+                (
+                    VLLMPagedMemLayerwiseGPUConnector,
+                    VLLMBufferLayerwiseGPUConnector,
+                    SGLangLayerwiseGPUConnector,
+                ),
+            )
+            mem_obj_consumer = self.gpu_connector.batched_to_gpu_batch(starts, ends, **kwargs)
+            next(mem_obj_consumer)
+
+            to_count_down = []
+            for layer_id in range(self.num_layers):
+                task = next(get_generator)
+
+                assert task is not None
+                
+                if layer_id == 0:
+                    # NOTE(Yuwei): For sglang integration we need to provide retrieved
+                    # tokens number in the first layer loading since there is no lookup
+                    yield torch.sum(ret_mask)
+                else:
+                    yield None
+
+                mem_objs_layer = task.result()
+                mem_obj_consumer.send(mem_objs_layer)
+                to_count_down.extend(mem_objs_layer)
+                
+                with nvtx.annotate("load full sync", color="red"):
+                    self.gpu_connector.load_stream.synchronize()
+                
+                with nvtx.annotate(f"load event add", color="#EE00FF"):
+                    event.record(self.gpu_connector.load_stream)
+
+            for mem_obj in to_count_down:
+                mem_obj.ref_count_down()
+        else:
+            # If no cache are found, we still need to yield to avoid
+            # `StopIteration`
+            for layer_id in range(self.num_layers):
+                yield None
+
+        yield None
+
+        # synchronize the last layer
+        next(mem_obj_consumer)
+
+        retrieved_tokens = torch.sum(ret_mask)
+        self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
+        logger.info(
+            f"Retrieved {retrieved_tokens} "
+            f"out of {num_required_tokens} "
+            f"out of total {len(all_tokens)} reqs"
         )
 
         yield ret_mask

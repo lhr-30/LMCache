@@ -29,6 +29,9 @@ class BlackholeConnector(RemoteConnector):
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
         pass
 
+    def put_sync(self, key: CacheEngineKey, memory_obj: MemoryObj):
+        pass
+
     @no_type_check
     async def list(self) -> List[str]:
         pass

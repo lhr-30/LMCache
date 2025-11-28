@@ -36,7 +36,24 @@ class InstrumentedRemoteConnector(RemoteConnector):
         end = time.perf_counter()
         self._stats_monitor.update_interval_remote_time_to_put((end - begin) * 1000)
         self._stats_monitor.update_interval_remote_write_metrics(obj_size)
-        logger.debug(
+        logger.info(
+            f"[{self.name}]Bytes offloaded: {obj_size / 1e6:.3f} MBytes "
+            f"in {(end - begin) * 1000:.3f}ms"
+        )
+        
+    def put_sync(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+        obj_size = memory_obj.get_size()
+        begin = time.perf_counter()
+        try:
+            self._connector.put_sync(key, memory_obj)
+        finally:
+            # Ensure reference count is decreased even if exception occurs
+            memory_obj.ref_count_down()
+
+        end = time.perf_counter()
+        self._stats_monitor.update_interval_remote_time_to_put((end - begin) * 1000)
+        self._stats_monitor.update_interval_remote_write_metrics(obj_size)
+        logger.info(
             f"[{self.name}]Bytes offloaded: {obj_size / 1e6:.3f} MBytes "
             f"in {(end - begin) * 1000:.3f}ms"
         )

@@ -119,7 +119,7 @@ class WeightedSemaphore:
             )
 
         async with self._cond:
-            logger.info(f"WeightedSemaphore: Attempting to acquire {n} chunks")
+            # logger.info(f"WeightedSemaphore: Attempting to acquire {n} chunks")
             if n <= self._concurrent_budget_cap:
                 await self._cond.wait_for(lambda: self._current_chunks >= n)
                 self._current_chunks -= n
@@ -130,10 +130,10 @@ class WeightedSemaphore:
                 )
                 # Reserve everything
                 self._current_chunks = 0
-            logger.info(
-                f"WeightedSemaphore: Acquired {n} chunks, "
-                f"remaining chunks: {self._current_chunks}"
-            )
+            # logger.info(
+            #     f"WeightedSemaphore: Acquired {n} chunks, "
+            #     f"remaining chunks: {self._current_chunks}"
+            # )
 
     async def release(self, n: int = 1) -> None:
         async with self._cond:
@@ -224,6 +224,7 @@ class StorageManager:
         self.event_manager = event_manager
 
         self.async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None
+        self.async_serializer = AsyncSerializer(self.allocator_backend, self.loop)
 
         # The cuda stream for internal copies during put
         if torch.cuda.is_available():
@@ -238,7 +239,6 @@ class StorageManager:
             #     "async loading."
             # )
             self.async_lookup_server = kwargs.pop("async_lookup_server")
-            self.async_serializer = AsyncSerializer(self.allocator_backend, self.loop)
 
     def _get_allocator_backend(
         self, config: LMCacheEngineConfig
@@ -265,6 +265,7 @@ class StorageManager:
         """
         # TODO (Jiayi): We might need to pre-allocate and management
         # disk in a similar way as CPU.
+        logger.info(f"backend is {self.allocator_backend}")
         return self.allocator_backend.allocate(
             shape, dtype, fmt, eviction=eviction, busy_loop=busy_loop
         )
@@ -413,6 +414,8 @@ class StorageManager:
 
         :return: A generator that yields a future for each layer.
         """
+        logger.info(f"location is {location}, storage_backends: {self.storage_backends.keys()}")
+        
         if location is None:
             location = "LocalCPUBackend"
 
@@ -530,11 +533,13 @@ class StorageManager:
         num_last_tier_hit_chunks = 0
         cum_chunk_lengths_total = cum_chunk_lengths[:]
         loading_tasks = []
+        logger.info(f"Starting async lookup and prefetch for lookup id {lookup_id}")
         for backend_name, backend in self.storage_backends.items():
             if search_range and backend_name not in search_range:
                 continue
+            logger.info(f"Looking up keys in backend {backend_name}: {keys}")
             num_hit_chunks = await backend.batched_async_contains(lookup_id, keys, pin)
-
+            logger.info(f"Backend {backend_name} hit {num_hit_chunks} chunks for lookup id {lookup_id}")
             if num_hit_chunks == 0:
                 continue
 

@@ -13,8 +13,8 @@ import traceback
 try:
     # Third Party
     from nvtx import annotate  # type: ignore
-except ImportError:
-
+except ImportError as e:
+    raise RuntimeError("NVTX not found! please install with pip install nvtx") from e
     def annotate(*args, **kwargs):
         """Dummy decorator when nvtx is not available."""
 

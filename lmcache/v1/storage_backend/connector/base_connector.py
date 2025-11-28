@@ -162,6 +162,19 @@ class RemoteConnector(metaclass=abc.ABCMeta):
             memory_obj: the memory_obj of the corresponding key
         """
         raise NotImplementedError
+    
+    @abc.abstractmethod
+    def put_sync(self, key: CacheEngineKey, memory_obj: MemoryObj):
+        """
+        Send the memory_obj with the corresponding key directly
+        to the remote server. Will decrease the ref count after
+        send finishes.
+
+        Input:
+            key: the CacheEngine key
+            memory_obj: the memory_obj of the corresponding key
+        """
+        raise NotImplementedError
 
     @abc.abstractmethod
     async def list(self) -> List[str]:

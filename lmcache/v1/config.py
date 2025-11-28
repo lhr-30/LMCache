@@ -114,6 +114,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": str,
     },
     "remote_serde": {"type": Optional[str], "default": "naive", "env_converter": str},
+    "remote_backend_proxy_url": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
     # Feature toggles
     "use_layerwise": {
         "type": bool,

@@ -76,7 +76,7 @@ class RemoteMetadata:
     fmt: MemoryFormat
 
     def serialize_into(self, buffer):
-        assert len(self.shape) == 4, "Shape dimension should be 4"
+        assert len(self.shape) == 4, "Shape dimension should be 4, self.shape: {self.shape}"
 
         struct.pack_into(
             "iiiiiii",
@@ -94,7 +94,11 @@ class RemoteMetadata:
     def serialize(self) -> bytes:
         # NOTE(Jiayi): 4 is the maximum dimension of memory object.
         # Pass in shape [x, 0, 0, 0] if it is a bytes memory object
-        assert len(self.shape) == 4, "Shape dimension should be 4"
+        
+        # for layerwise
+        if len(self.shape) == 3:
+            self.shape = torch.Size([self.shape[0], 1, self.shape[1], self.shape[2]])
+        assert len(self.shape) == 4, f"Shape dimension should be 4, self.shape: {self.shape}"
 
         packed_bytes = struct.pack(
             "iiiiiii",

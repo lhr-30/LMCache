@@ -19,6 +19,9 @@ from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.naive_serde import CreateSerde
 
+import zmq
+import msgspec
+
 logger = init_logger(__name__)
 
 
@@ -39,6 +42,17 @@ class RemoteBackend(StorageBackendInterface):
 
         self.remote_url = config.remote_url
         self.blocking_timeout_secs = config.blocking_timeout_secs
+        self.remote_backend_proxy_url = config.remote_backend_proxy_url
+        self.zmq_context = zmq.Context.instance()
+        
+        logger.info(f"config is {config}")
+        if self.remote_backend_proxy_url is not None:
+            self.remote_backend_proxy_side_channel = self.zmq_context.socket(zmq.PUSH)
+            self.remote_backend_proxy_side_channel.linger = 0
+            self.remote_backend_proxy_side_channel.connect(self.remote_backend_proxy_url)
+            logger.info(f"[ZMQ] Connected synchronously to remote backend proxy at {self.remote_backend_proxy_url}")
+        self.put_tasks = set()
+        self.req_inflight = {}
 
         self.local_cpu_backend = local_cpu_backend
 
@@ -169,17 +183,32 @@ class RemoteBackend(StorageBackendInterface):
         with self.lock:
             return key in self.put_tasks
 
-    def put_callback(self, future: Future, key: CacheEngineKey):
+    def _notify_proxy(self, req_id: str):
+        if not self.remote_backend_proxy_side_channel:
+            return
+        try:
+            payload = msgspec.msgpack.encode({"req_id": req_id})
+            self.remote_backend_proxy_side_channel.send(payload, zmq.NOBLOCK)
+        except Exception as e:
+            logger.error(f"Failed to notify proxy for req_id={req_id}: {e}")
+
+    def put_callback(self, future: Future, key: CacheEngineKey, req_id: str = "", is_last_prefill: bool = False):
         """
         Callback function for put tasks.
         """
         with self.lock:
             self.put_tasks.discard(key)
+            self.req_inflight[req_id] -= 1
+            if self.req_inflight[req_id] == 0 and is_last_prefill:
+                del self.req_inflight[req_id]
+                self._notify_proxy(req_id)
 
     def submit_put_task(
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        req_id: str = "",
+        is_last_prefill: bool = False,
     ) -> Future:
         def create_immediate_empty_future() -> Future:
             f: Future = Future()
@@ -201,18 +230,22 @@ class RemoteBackend(StorageBackendInterface):
 
         with self.lock:
             self.put_tasks.add(key)
+            self.req_inflight[req_id] += 1
 
         compressed_memory_obj = self.serializer.serialize(memory_obj)
         memory_obj.ref_count_down()
 
         # NOTE: No need to do error handling here
         # since the `future` is never waited
+        logger.info(f"connection is {self.connection}")
         future = asyncio.run_coroutine_threadsafe(
             self.connection.put(key, compressed_memory_obj), self.loop
         )
-        lambda_callback = lambda f: self.put_callback(f, key)
+        lambda_callback = lambda f: self.put_callback(f, key, req_id, is_last_prefill)
         future.add_done_callback(lambda_callback)
         return future
+        # self.connection.put_sync(key, compressed_memory_obj)
+        return None
 
     def batched_put_callback(self, future: Future, keys: List[CacheEngineKey]):
         """
@@ -250,8 +283,11 @@ class RemoteBackend(StorageBackendInterface):
             lambda_callback = lambda f: self.batched_put_callback(f, keys)  # type: ignore
             future.add_done_callback(lambda_callback)
         else:
+            logger.info(f"Connector does not support batched put, using single put instead, request id: {transfer_spec.req_id}, is last prefill: {transfer_spec.is_last_prefill}")
+            with self.lock:
+                self.req_inflight[transfer_spec.req_id] = 0
             for key, memory_obj in zip(keys, memory_objs, strict=False):
-                self.submit_put_task(key, memory_obj)
+                self.submit_put_task(key, memory_obj, req_id=transfer_spec.req_id, is_last_prefill=transfer_spec.is_last_prefill)
 
     @_lmcache_nvtx_annotate
     def get_blocking(

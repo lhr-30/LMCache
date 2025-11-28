@@ -257,7 +257,7 @@ class ChunkedTokenDatabase(TokenDatabase):
             raise ValueError(
                 "The number of Falses in the mask is not a multiple of the chunk size."
             )
-
+        
         if tokens is not None:
             total_len = len(tokens)
             token_chunks = self._chunk_tokens(tokens)
@@ -269,6 +269,7 @@ class ChunkedTokenDatabase(TokenDatabase):
                     continue
                 else:
                     if make_key:
+                        # logger.info(f"token id {tokens[start_idx:end_idx]}, hash {hash_val}")
                         yield (
                             start_idx,
                             end_idx,

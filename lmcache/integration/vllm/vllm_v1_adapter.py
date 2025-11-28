@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
     
 import time
+import nvtx
 
 logger = init_logger(__name__)
 
@@ -695,6 +696,9 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
 
         self._requests_priority: dict[str, int] = {}
+        
+        self.load_event = torch.cuda.Event()
+        self.save_event = torch.cuda.Event()
 
         # TODO(baoloongmao): Internal api server & plugin framework support dp > 1
         if vllm_config.parallel_config.data_parallel_rank_local == 0:
@@ -799,7 +803,7 @@ class LMCacheConnectorV1Impl:
     ####################
 
     @_lmcache_nvtx_annotate
-    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+    def start_load_kv_ori(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
         paged KV buffer.
 
@@ -811,6 +815,7 @@ class LMCacheConnectorV1Impl:
             The number of elements in kv_caches and layer_names should be
             the same.
         """
+        logger.debug("LMCacheConnectorV1Impl.start_load_kv called")
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
@@ -921,6 +926,94 @@ class LMCacheConnectorV1Impl:
                         num_expected_tokens,
                     )
 
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        """Start loading the KV cache from the connector buffer to vLLM's
+        paged KV buffer.
+
+        Args:
+            forward_context (ForwardContext): the forward context.
+            **kwargs: additional arguments for the load operation
+
+        Note:
+            The number of elements in kv_caches and layer_names should be
+            the same.
+        """
+        self.current_layer = 0
+
+        if len(self.kv_caches) == 0:
+            self._init_kv_caches_from_forward_context(forward_context)
+
+        metadata = self._parent._get_connector_metadata()
+        assert isinstance(metadata, LMCacheConnectorMetadata)
+
+        assert len(self.kv_caches) > 0
+        kvcaches = list(self.kv_caches.values())
+
+        attn_metadata = forward_context.attn_metadata
+        if attn_metadata is None:
+            logger.debug("In connector.start_load_kv, but the attn_metadata is None")
+            return
+
+        assert self.lmcache_engine is not None
+
+        self.lmcache_engine.post_init(kvcaches=kvcaches)
+
+        self.layerwise_retrievers = []
+
+        for idx, request in enumerate(metadata.requests):
+            if request.load_spec is None:
+                continue
+            last_idx = idx
+
+        all_tokens = []
+        all_masks = []
+        all_slot_mappings = []
+        req_count = 0
+        for idx, request in enumerate(metadata.requests):
+            if request.load_spec is None:
+                continue
+            req_count += 1
+            tokens = request.token_ids
+            # TODO: have a pre-allocated buffer to hold the slot_mappings
+            slot_mapping = request.slot_mapping.cuda()
+            assert len(tokens) == len(slot_mapping)
+
+            self._stats_monitor.update_interval_vllm_hit_tokens(
+                request.load_spec.vllm_cached_tokens
+            )
+            token_mask = torch.ones(len(tokens), dtype=torch.bool)
+            masked_token_count = (
+                request.load_spec.vllm_cached_tokens
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+            token_mask[:masked_token_count] = False
+
+            lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            logger.info(f"Loading KV for request {request.req_id} with {len(tokens)} tokens, LMCache cached tokens: {lmcache_cached_tokens}, masked_token_count: {masked_token_count}")
+        
+            all_tokens.append(tokens[:lmcache_cached_tokens])
+            all_masks.append(token_mask[:lmcache_cached_tokens])
+            all_slot_mappings.append(slot_mapping[:lmcache_cached_tokens])
+            
+        if req_count == 0:
+            return
+        
+        if self.use_layerwise:
+            layerwise_retriever = self.lmcache_engine.retrieve_layer_batch(
+                all_tokens,
+                all_masks,
+                kvcaches=kvcaches,
+                all_slot_mappings=all_slot_mappings,
+                event=self.load_event
+            )
+            
+            next(layerwise_retriever)
+            next(layerwise_retriever)
+            self.layerwise_retrievers.append(layerwise_retriever)
+
+    
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
@@ -931,22 +1024,25 @@ class LMCacheConnectorV1Impl:
         Args:
             layer_name: the name of that layer
         """
-        if self.layerwise_retrievers:
-            logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
+        # if self.layerwise_retrievers:
+        #     logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
 
-        # Wait for the layer to be loaded
+        # i layer is loaded, we need to wait for the load event. only after load event finished, we can process the attention layer
+        with nvtx.annotate(f"load event wait", color="#EE00FF"):
+            torch.cuda.current_stream().wait_event(self.load_event)
+
+        # call i+1 th layer retriever
         for layerwise_retriever in self.layerwise_retrievers:
             ret_token_mask = next(layerwise_retriever)
-
+                
             if self.current_layer == self.num_layers - 1:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info(f"Retrieved {num_retrieved_tokens} tokens")
-
         return
 
     @_lmcache_nvtx_annotate
-    def save_kv_layer(
+    def save_kv_layer_ori(
         self,
         layer_name: str,
         kv_layer: torch.Tensor,
@@ -1043,6 +1139,112 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
+        for layerwise_storer in self.layerwise_storers:
+            next(layerwise_storer)
+
+        self.current_layer += 1
+        
+    @_lmcache_nvtx_annotate
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        assert self.lmcache_engine is not None
+
+        if not self.use_layerwise:
+            return
+
+        if self.kv_role == "kv_consumer":
+            # Don't do save if the role is kv_consumer
+            return
+        if self._parent._connector_metadata is None:
+            logger.warning(
+                "In connector.save_kv_layer, but the connector metadata is None"
+            )
+            return
+        connector_metadata = self._parent._get_connector_metadata()
+        assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+
+        assert len(self.kv_caches) > 0
+        
+        # add attn event
+        with nvtx.annotate(f"store event add", color="#EE00FF"):
+            self.save_event.record(torch.cuda.current_stream())
+
+        kvcaches = list(self.kv_caches.values())
+        if self.current_layer == 0:
+            all_tokens = []
+            all_masks = []
+            all_slot_mappings = []
+            req_count = 0
+            token_count = 0
+            self.layerwise_storers = []
+
+            is_first = True
+
+            for idx, request in enumerate(connector_metadata.requests):
+                save_spec = request.save_spec
+                if save_spec is None or not save_spec.can_save or len(request.token_ids) < self._lmcache_chunk_size:
+                    continue
+
+                token_ids = request.token_ids
+                token_ids = token_ids[: len(token_ids) - (len(token_ids) % self._lmcache_chunk_size)]
+                token_count += len(token_ids)
+
+                # logger.info(f"Saving KV cache for request {request.req_id} with {len(token_ids)} tokens")
+                assert isinstance(token_ids, list)
+                assert len(token_ids) % self._lmcache_chunk_size == 0
+
+                slot_mapping = request.slot_mapping
+                slot_mapping = slot_mapping[: len(slot_mapping) - (len(slot_mapping) % self._lmcache_chunk_size)]
+                assert isinstance(slot_mapping, torch.Tensor)
+                assert len(slot_mapping) == len(token_ids)
+
+                # TODO: have a pre-allocated buffer to hold the slot_mappings
+                slot_mapping = slot_mapping.cuda()
+
+                if self.kv_role == "kv_producer":
+                    skip_leading_tokens = 0
+                else:
+                    skip_leading_tokens = save_spec.skip_leading_tokens
+
+                    if skip_leading_tokens == len(token_ids):
+                        continue  # skip this request
+                    # Align to lmcache chunk size
+                    skip_leading_tokens = (
+                        skip_leading_tokens
+                        // self._lmcache_chunk_size
+                        * self._lmcache_chunk_size
+                    )
+
+                store_mask = torch.ones(len(token_ids), dtype=torch.bool)
+                store_mask[:skip_leading_tokens] = False
+                
+                all_tokens.append(token_ids)
+                all_masks.append(store_mask)
+                all_slot_mappings.append(slot_mapping)
+
+            # TODO (Jiayi): need to make layerwise storing
+            # compatible with disagg spec
+            if len(all_tokens) == 0:
+                return
+            
+            logger.info(f"Storing KV cache for {len(all_tokens)} requests with {token_count} tokens")
+            layerwise_storer = self.lmcache_engine.store_layer_batch(
+                all_tokens=all_tokens,
+                all_masks=all_masks,
+                kvcaches=kvcaches,
+                all_slot_mappings=all_slot_mappings,
+                offset=skip_leading_tokens,
+                sync=is_first,
+            )
+            self.layerwise_storers.append(layerwise_storer)
+        
+        with nvtx.annotate(f"store event wait", color="#EE00FF"):
+            self.lmcache_engine.gpu_connector.store_stream.wait_event(self.save_event)
         for layerwise_storer in self.layerwise_storers:
             next(layerwise_storer)
 

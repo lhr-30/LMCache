@@ -21,6 +21,11 @@ from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+io_executor = ThreadPoolExecutor(max_workers=64)
+
 logger = init_logger(__name__)
 
 METADATA_BYTES_LEN = 28
@@ -241,6 +246,7 @@ class MooncakestoreConnector(RemoteConnector):
         return True
 
     async def exists(self, key: CacheEngineKey) -> bool:
+        logger.info(f"Mooncake connector: Checking existence for key: {key.to_string()}")
         return self.store.is_exist(key.to_string())
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
@@ -439,6 +445,20 @@ class MooncakestoreConnector(RemoteConnector):
         else:
             # Use put_from without metadata (zero-copy)
             await self._put_without_metadata(key_str, memory_obj)
+            
+    def put_sync(self, key: CacheEngineKey, memory_obj: MemoryObj):
+        """
+        Put operation with metadata-consistent handling.
+        Uses put_from (without metadata) or
+        put_parts (with metadata) to match get behavior.
+        """
+        key_str = key.to_string()
+
+        # Check metadata handling mode to match get behavior
+        if self.save_chunk_meta:
+            # Use put_parts with metadata stored remotely
+            # await self._put_with_metadata(key_str, memory_obj)
+            self._put_with_metadata_sync(key_str, memory_obj)
 
     async def _put_without_metadata(self, key_str: str, memory_obj: MemoryObj):
         """
@@ -480,6 +500,7 @@ class MooncakestoreConnector(RemoteConnector):
         """
         try:
             # Serialize data and metadata
+            logger.info(f"kv shape in put_with_metadata: {memory_obj.get_shape()}")
             kv_bytes = memory_obj.byte_array
             kv_shape = memory_obj.get_shape()
             kv_dtype = memory_obj.get_dtype()
@@ -490,22 +511,64 @@ class MooncakestoreConnector(RemoteConnector):
             ).serialize()
             assert len(metadata_bytes) == METADATA_BYTES_LEN
 
-            await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.store.put_parts, key_str, metadata_bytes, kv_bytes
-                ),
-                timeout=self.config.transfer_timeout,
+            logger.info(f"Calling store.put_parts for key={key_str}...")
+            # await asyncio.wait_for(
+            #     asyncio.to_thread(
+            #         self.store.put_parts, key_str, metadata_bytes, kv_bytes
+            #     ),
+            #     timeout=self.config.transfer_timeout,
+            # )
+            # await asyncio.wait_for(
+            #     asyncio.get_running_loop().run_in_executor(
+            #         io_executor, self.store.put_parts, key_str, metadata_bytes, kv_bytes
+            #     ),
+            #     timeout=self.config.transfer_timeout,
+            # )
+            await asyncio.get_running_loop().run_in_executor( 
+                io_executor, self.store.put_parts, key_str, metadata_bytes, kv_bytes 
             )
         except asyncio.TimeoutError:
+            import traceback
+            logger.warning(traceback.format_exc())
             logger.warning(
                 f"Timeout when putting key {key_str} using put_parts. "
                 "Decode instance may redo prefill."
             )
         except Exception as e:
+            import traceback
+            logger.warning(traceback.format_exc())
             logger.error(
                 f"Failed to put key {key_str} using put_parts: "
                 f"{type(e).__name__}: {str(e)}"
             )
+            raise
+
+    def _put_with_metadata_sync(self, key_str: str, memory_obj: MemoryObj):
+        """
+        Synchronous version of put_with_metadata for debugging.
+        Temporarily disables asyncio to help debug blocking behavior.
+        """
+        try:
+            logger.info(f"[SYNC] kv shape in put_with_metadata: {memory_obj.get_shape()}")
+            kv_bytes = memory_obj.byte_array
+            kv_shape = memory_obj.get_shape()
+            kv_dtype = memory_obj.get_dtype()
+            memory_format = memory_obj.get_memory_format()
+
+            metadata_bytes = RemoteMetadata(
+                len(kv_bytes), kv_shape, kv_dtype, memory_format
+            ).serialize()
+            assert len(metadata_bytes) == METADATA_BYTES_LEN
+
+            logger.info(f"[SYNC] Calling store.put_parts for key={key_str}...")
+            t0 = time.time()
+            self.store.put_parts(key_str, metadata_bytes, kv_bytes)
+            t1 = time.time()
+            logger.info(f"[SYNC] Finished store.put_parts for {key_str} in {t1 - t0:.3f}s")
+
+        except Exception as e:
+            import traceback
+            logger.error("[SYNC] Exception in _put_with_metadata_sync:\n" + traceback.format_exc())
             raise
 
     @no_type_check

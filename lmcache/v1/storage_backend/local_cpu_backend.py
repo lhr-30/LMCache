@@ -66,6 +66,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if memory_allocator is None
             else memory_allocator
         )
+        logger.info(f"Initialized memory allocator: {self.memory_allocator}")
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
         self.cpu_lock = threading.Lock()
@@ -129,7 +130,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
         """
 
         with self.cpu_lock:
+            # logger.info(f"Submitting put task for key {key} to local CPU backend")
             if key in self.hot_cache:
+                # logger.info(f"Key {key} already exists in local CPU backend")
                 return None
 
             memory_obj.ref_count_up()
@@ -222,6 +225,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     # vllm lookup sets pin to True
                     self.keys_in_request.append(key)
                 num_hit_chunks += 1
+        logger.info(f"look up for keys: {keys}, hit num chunks: {num_hit_chunks}")
         return num_hit_chunks
 
     def pin(self, key: CacheEngineKey) -> bool:
